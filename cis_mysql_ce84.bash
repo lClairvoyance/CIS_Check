@@ -10,6 +10,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 shopt -s lastpipe
+trap 'echo "ERROR: line $LINENO: $BASH_COMMAND" >&2' ERR
 
 # ---------------------- Existing runtime knobs (preserved) ----------------------
 PROFILE="${PROFILE:-L1}"      # L1/L2   (kept for backward compatibility)
@@ -49,7 +50,7 @@ WILDCARD_TARGET_HOST="${WILDCARD_TARGET_HOST:-localhost}"
 
 # ---------------------- New toggles & outputs ----------------------
 LEVEL_TOGGLE="both"        # 1|2|both
-FORMAT="csv"               # csv|json|xlsx
+FORMAT="csv"               # csv
 EXCLUDE_EMPTY="NO"         # YES/NO
 
 usage() {
@@ -59,7 +60,7 @@ Usage:
 
 Options (new):
   -L 1|2|both      Level toggle (default: both)
-  -f csv|json|xlsx Output format (default: csv; json/xlsx created via Python helper)
+  -f csv            Output format (default: csv)
   -o <file>        Output CSV path (default: $REPORT or cis_ce84_report.csv)
   --exclude-empty  Exclude rows where Detail is empty or '-'
   -h               Help
@@ -67,7 +68,7 @@ Options (new):
 Notes:
 - Your original environment variables still work (PROFILE, SCOPE, REMEDIATION, MYSQL_BIN, MYSQL_OPTS, REPORT, etc.).
 - On Windows (Git Bash / MSYS / MINGW), default SCOPE=rdbms to avoid Linux-only commands.
-- JSON/XLSX export requires Python 3. If not present, CSV is still produced.
+- Only CSV is supported (no Python, no XLSX/JSON).
 USAGE
 }
 
@@ -140,6 +141,19 @@ mysqld_var()  { run_sql "SELECT VARIABLE_VALUE FROM performance_schema.global_va
 set_persist() {
   local k="$1" v="$2"
   [[ "$REMEDIATION" == "YES" ]] && run_sql "SET PERSIST ${k}=${v};" || true
+}
+
+# Resolve a variable name that may differ across versions (e.g., log_raw vs log-raw)
+resolve_var_name() {
+  local a="$1" b="${2:-}"
+  local v
+  v="$(mysqld_var "$a" || true)"
+  if [[ -n "$v" && "$v" != "NULL" ]]; then echo "$a"; return 0; fi
+  if [[ -n "$b" ]]; then
+    v="$(mysqld_var "$b" || true)"
+    [[ -n "$v" && "$v" != "NULL" ]] && echo "$b" && return 0
+  fi
+  echo "$a"
 }
 
 ensure_plugin_active() {
@@ -619,7 +633,16 @@ c6_3(){
 
 c6_4(){
   local t="6.4 log-raw=OFF"
-  local v; v="$(mysqld_var 'log-raw' || mysqld_var 'log_raw' || echo 'OFF')"; [[ "$v" == "OFF" ]] && emit "6.4" "$t" "PASS" "log-raw=OFF" || { [[ "$REMEDIATION" == "YES" ]] && set_persist "`[[ $(mysqld_var 'log-raw') ]] && echo 'log-raw' || echo 'log_raw'`" "OFF"; v="$(mysqld_var 'log-raw' || mysqld_var 'log_raw' || echo 'OFF')"; [[ "$v" == "OFF" ]] && emit "6.4" "$t" "PASS" "set" || emit "6.4" "$t" "FAIL" "log-raw=$v"; }
+  local vn val
+  vn="$(resolve_var_name 'log_raw' 'log-raw')"
+  val="$(mysqld_var "$vn" || echo 'OFF')"
+  if [[ "$val" == "OFF" ]]; then
+    emit "6.4" "$t" "PASS" "$vn=OFF"
+  else
+    [[ "$REMEDIATION" == "YES" ]] && set_persist "$vn" "OFF"
+    val="$(mysqld_var "$vn" || echo 'OFF')"
+    [[ "$val" == "OFF" ]] && emit "6.4" "$t" "PASS" "set" || emit "6.4" "$t" "FAIL" "$vn=$val"
+  fi
 }
 
 c6_audit_enterprise_na(){ emit "6.5-6.8" "6.5–6.8 Enterprise Audit controls" "N/A" "MySQL Enterprise Audit is commercial-only"; }
@@ -815,22 +838,11 @@ main() {
   log "Remediation SQL (if any): $REM_SQL_OUT"
   log "Remediation instructions (if any): $REM_INSTR_OUT"
 
-  # Optional post-export: JSON/XLSX
+  # Export summary (CSV only)
   case "$FORMAT" in
     csv) log "CSV saved: $REPORT" ;;
-    json|xlsx)
-      # Try Python (python3 or 'py' launcher on Windows)
-      py_helper="$(dirname "$REPORT")/cis_export_helper.py"
-      if command_exists python3; then
-        python3 "$py_helper" --input "$REPORT" --json "$REPORT.json" --xlsx "$REPORT.xlsx" || true
-      elif command_exists py; then
-        py "$py_helper" --input "$REPORT" --json "$REPORT.json" --xlsx "$REPORT.xlsx" || true
-      else
-        log "Python not found; only CSV created. Install Python 3 for JSON/XLSX export."
-      fi
-      [[ "$FORMAT" == "json" ]] && log "JSON saved: $REPORT.json"
-      [[ "$FORMAT" == "xlsx" ]] && log "XLSX saved: $REPORT.xlsx"
-      ;;
+    *)   log "Only CSV supported; saved: $REPORT" ;;
   esac
 }
 main
+
