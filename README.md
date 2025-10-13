@@ -1,5 +1,3 @@
-mkdir -p docs
-cat > docs/README-ce84.md <<'EOF'
 # CIS MySQL Community Server 8.4 Benchmark (Automated Checks)
 
 ## Purpose
